@@ -67,7 +67,30 @@ vsce package
 ```
 
 ### Testing
+Run `npm test` to compile the extension and chat view, run lint, and execute the
+headless Mocha Local Replica regression suite. The tests mock VS Code file events
+and remote storage; they never connect to a real Overleaf project. Type-check only
+with `npx tsc -p . --noEmit`.
+
 In VSCode, press <kbd>F5</kbd> to start debugging. A new VSCode window will be opened with the extension loaded.
+
+### Package and install a local build
+
+Use Node.js 24 LTS for the current lockfiles (the locked `undici` requires Node
+22.19 or newer). From the repository root:
+
+```bash
+npm ci
+npm --prefix views/chat-view ci
+npm test
+npx --yes @vscode/vsce package --out overleaf-workshop-local.vsix
+code --install-extension overleaf-workshop-local.vsix --force
+```
+
+Alternatively, select **Extensions: Install from VSIX...** in VS Code and choose
+the generated file, then reload the window. Packaging runs the compile script;
+it does not publish the extension. See [nested replica configuration](docs/wiki.md#nested-replicas-and-external-tools)
+for the recommended settings and initialization backup precautions.
 
 ### Documentation
 - [VSCode Extension API](https://code.visualstudio.com/api/references/vscode-api)
