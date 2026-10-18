@@ -135,8 +135,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
         if (this.localReplicaBaseUri) {
             // Local activation must never restore other historical replica directories.
             const baseUri = this.localReplicaBaseUri;
-            const persist = Object.values(scmPersists).find(item => item.label===LocalReplicaSCMProvider.label
+            const matches = Object.values(scmPersists).filter(item => item.label===LocalReplicaSCMProvider.label
                 && replicaKey(this.persistedUri(item.baseUri))===replicaKey(baseUri));
+            // Prefer edits saved under the canonical key over older absolute-path records.
+            const persist = matches.find(item => item===scmPersists[baseUri.toString()]) ?? matches[0];
             this.vfs.setProjectSCMPersist(baseUri.toString(), {
                 enabled: persist?.enabled ?? true,
                 label: LocalReplicaSCMProvider.label,

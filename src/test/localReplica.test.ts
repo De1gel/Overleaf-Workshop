@@ -305,6 +305,29 @@ suite('Local replica SCM registration', () => {
         assert.strictEqual(state.saved.listeners.size, 0);
     });
 
+    test('prefers current canonical settings over an earlier stale legacy path record', async () => {
+        state.config.set('overleaf-workshop.localReplica.syncOnFileChange.enabled', true);
+        state.persists = {
+            [base.path]: {
+                label: LocalReplicaSCMProvider.label, enabled: false, baseUri: base.path,
+                settings: {['ignore-patterns']: ['**/old-only.tex']},
+            },
+            [base.toString()]: {
+                label: LocalReplicaSCMProvider.label, enabled: true, baseUri: base.toString(),
+                settings: {['ignore-patterns']: ['**/current-only.tex']},
+            },
+        };
+        await create().ready;
+        assert.strictEqual(state.watchers.filter(item => item.active).length, 2);
+        state.operations = [];
+        await externalWrite(Uri.joinPath(base, 'current-only.tex'), 'ignored by current settings');
+        await externalWrite(Uri.joinPath(base, 'old-only.tex'), 'allowed by current settings');
+        await settle();
+        await assert.rejects(mockVscode.workspace.fs.stat(Uri.joinPath(origin, 'current-only.tex')), {code: 'FileNotFound'});
+        assert.strictEqual(content(Uri.joinPath(origin, 'old-only.tex')), 'allowed by current settings');
+        assert.strictEqual(state.operations.filter(operation => operation.uri.scheme === origin.scheme && operation.type === 'write').length, 1);
+    });
+
     test('disposes a watcher session that finishes initializing after collection shutdown', async () => {
         let release: () => void = () => {};
         const gate = new Promise<void>(resolve => { release = resolve; });
