@@ -8,6 +8,9 @@ import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private hasUnreadMessages = 0;
     private webviewView?: vscode.WebviewView;
+    private disposed = false;
+    private readonly insertTasks = new Set<ReturnType<typeof setTimeout>>();
+    private messageListener?: vscode.Disposable;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -38,9 +41,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     resolveWebviewView(webviewView: vscode.WebviewView, context: vscode.WebviewViewResolveContext<unknown>, token: vscode.CancellationToken): Thenable<void> {
         this.webviewView = webviewView;
         return this.loadWebviewHtml(webviewView.webview).then((html) => {
+            if (this.disposed) { return; }
             webviewView.webview.options = {enableScripts:true};
             webviewView.webview.html = html;
-            webviewView.webview.onDidReceiveMessage((e) => {
+            this.messageListener?.dispose();
+            this.messageListener = webviewView.webview.onDidReceiveMessage((e) => {
+                if (this.disposed) { return; }
                 switch (e.type) {
                     case 'get-messages': this.getMessages(); break;
                     case 'send-message': this.sendMessage(e.content); break;
@@ -56,8 +62,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async getMessages() {
+        if (this.disposed) { return; }
         const messages = await this.vfs.getMessages();
-        if (this.webviewView !== undefined) {
+        if (!this.disposed && this.webviewView !== undefined) {
             this.webviewView.webview.postMessage({
                 type: 'get-messages',
                 content: messages,
@@ -67,10 +74,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private sendMessage(content: string) {
+        if (this.disposed) { return; }
         this.vfs.sendMessage(this.publicId, content);
     }
 
     private onReceivedMessage(message: ProjectMessageResponseSchema) {
+        if (this.disposed) { return; }
         if (this.webviewView !== undefined) {
             this.webviewView.webview.postMessage({
                 type: 'new-message',
@@ -98,9 +107,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     insertText(text: string='') {
+        if (this.disposed) { return; }
         this.revealChatView();
         if (this.webviewView === undefined) {
-            setTimeout(() => this.insertText(text), 100);
+            const task = setTimeout(() => {
+                this.insertTasks.delete(task);
+                this.insertText(text);
+            }, 100);
+            this.insertTasks.add(task);
             return;
         }
 
@@ -133,6 +147,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     get triggers() {
         return [
+            new vscode.Disposable(() => {
+                this.disposed = true;
+                this.insertTasks.forEach(task => clearTimeout(task));
+                this.insertTasks.clear();
+                this.messageListener?.dispose();
+                this.webviewView = undefined;
+            }),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.copyLineRef`, () => {
                 const ref = this.getLineRef();

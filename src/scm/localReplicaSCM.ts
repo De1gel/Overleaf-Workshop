@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
+import { containsLocalUri, discoverLocalReplicas, replicaKey, selectLocalReplica } from './localReplicaSettings';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -115,43 +116,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     public static async pathToUri(path: string): Promise<vscode.Uri | undefined> {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
-
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
-        try {
-            await vscode.workspace.fs.stat(settingUri);
-            return vscode.Uri.joinPath(workspaceRoot, path);
-        } catch (error) {
-            return undefined;
-        }
+        const replica = selectLocalReplica(await discoverLocalReplicas());
+        if (!replica || path.split(/[\\/]/).includes('..')) { return undefined; }
+        const uri = vscode.Uri.joinPath(replica.baseUri, path);
+        return containsLocalUri(replica.baseUri, uri) ? uri : undefined;
     }
 
     public static async uriToPath(uri: vscode.Uri): Promise<string | undefined> {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (workspaceRoot===undefined || workspaceRoot?.scheme!=='file') { return undefined; }
-
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
-        try {
-            await vscode.workspace.fs.stat(settingUri);
-            return uri.path.slice(workspaceRoot.path.length);
-        } catch (error) {
-            return undefined;
-        }
+        const replica = selectLocalReplica(await discoverLocalReplicas());
+        if (!replica || !containsLocalUri(replica.baseUri, uri)) { return undefined; }
+        return uri.path.slice(replica.baseUri.path.replace(/\/+$/, '').length);
     }
 
-    public static async readSettings(): Promise<any | undefined> {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri;
-        if (vscode.workspace.workspaceFolders?.length!==1 || workspaceRoot?.scheme!=='file') { return undefined; }
-
-        const settingUri = vscode.Uri.joinPath(workspaceRoot, '.overleaf/settings.json');
-        try {
-            await vscode.workspace.fs.stat(settingUri);
-            const content = await vscode.workspace.fs.readFile(settingUri);
-            return JSON.parse( new TextDecoder().decode(content) );
-        } catch (error) {
+    public static async readSettings(resource?: vscode.Uri) {
+        const replica = selectLocalReplica(await discoverLocalReplicas());
+        if (!replica || (resource && replicaKey(resource)!==replicaKey(replica.baseUri) && !containsLocalUri(replica.baseUri, resource))) {
             return undefined;
         }
+        return replica.settings;
     }
 
     private matchIgnorePatterns(path: string): boolean {

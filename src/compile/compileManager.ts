@@ -142,12 +142,13 @@ export class CompileManager {
     static async check(uri?: vscode.Uri) {
         // check if supported vfs
         uri = uri || vscode.window.activeTextEditor?.document.uri;
+        const resource = uri;
         uri = uri || vscode.workspace.workspaceFolders?.[0].uri;
         if (uri?.scheme === ROOT_NAME) {
             return uri;
         }
         // check if supported local replica
-        const localSetting = await LocalReplicaSCMProvider.readSettings();
+        const localSetting = await LocalReplicaSCMProvider.readSettings(resource);
         if (localSetting?.uri && localSetting?.enableCompileNPreview===true) {
             return vscode.Uri.parse(localSetting.uri);
         }

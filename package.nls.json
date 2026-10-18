@@ -51,6 +51,7 @@
 
     "configuration.compileOnSave.enabled.markdownDescription": "Always update the compiled PDF when a file is saved.",
     "configuration.localReplica.syncOnFileChange.enabled.markdownDescription": "Sync Local Replica changes made by external tools. (Take effect after restarting VSCode)",
+    "configuration.localReplica.paths.markdownDescription": "Local Replica directories containing `.overleaf/settings.json`. Relative paths resolve against each workspace folder; absolute paths are also accepted. One replica is active per window (the first valid workspace root or configured path). Back up unsynchronized local changes before activation: existing initialization downloads remote files.",
     "configuration.compileOutputFolderName.markdownDescription": "The name of the folder where the compiled output files (e.g., `output.pdf`) is located. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.markdownDescription": "Configure the color themes used by the PDF viewer. (Take effect after restarting VSCode)",
     "configuration.pdfViewer.themes.theme.description": "The name of the theme.",

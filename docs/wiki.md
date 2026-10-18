@@ -334,6 +334,58 @@ The project-related metadata for local replica are located in `.overleaf/setting
 ```
 Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. The default value is `false`.
 
+#### Nested replicas and external tools
+
+A replica opened directly as a workspace folder is still recognized automatically.
+To open its parent project instead, add explicit paths in that workspace's VS Code settings:
+
+```json
+{
+    "overleaf-workshop.localReplica.paths": ["Paper/MaaS bundle design"],
+    "overleaf-workshop.localReplica.syncOnFileChange.enabled": true
+}
+```
+
+The configured directory must already contain the original `.overleaf/settings.json`.
+Relative paths resolve against each workspace folder, including folder-specific settings
+in multi-root workspaces; absolute paths are accepted too. Relative paths escaping their
+workspace folder, missing directories, and invalid settings are ignored. There is no
+recursive search. Duplicate paths do not create extra watchers.
+
+One replica is active per window because the existing project commands and webviews
+are shared. Workspace folders are considered in order: each directly opened replica
+first, then its configured paths in array order. If more than one valid replica is
+found, a warning explains that only the first is active. Use separate windows for
+independent replicas. Path/workspace changes release the previous watchers before
+activating the new selection; reload the window after editing `.overleaf/settings.json`.
+
+Only the selected replica directory synchronizes. In the example, `Code/` and
+`Paper/build/` remain outside the synchronization root. The project's historical
+replica paths are not automatically enabled in other directories. Existing ignore
+patterns remain in effect; `.overleaf/`, `.git/`, and `.vscode/` always stay local,
+even with custom patterns. Symbolic links inside the replica are not followed.
+For generated files inside the replica, add an ignore pattern such as `**/build/**`
+using the Local Replica source control settings.
+
+The external-file setting remains `false` by default for compatibility. With `true`,
+VS Code saves and file-system modifications from shell commands, Python, external
+editors, and coding agents use the same synchronization path. A short per-file
+debounce coalesces rapid events and common atomic replacements; unchanged contents
+and echoes of remote writes do not cause duplicate uploads. Creation and deletion
+remain watched with either setting. Reload VS Code after changing this setting.
+
+**Back up unsynchronized local work before activation, reload, or re-enabling a
+replica.** The existing initialization is remote-authoritative when no in-memory
+base exists: remote files can overwrite local files with the same paths. Local-only
+files are not uploaded by the initial download. This patch does not change the
+existing merge/conflict behavior, provide offline reconciliation, or guarantee that
+Overleaf Comments and Track Changes survive every synchronization operation.
+
+The automated regressions use simulated VS Code events and Overleaf storage, without
+logging document contents or requiring an account. Before relying on this workflow
+for research files, verify bidirectional edits, an external atomic save, and ignored
+paths with a disposable Overleaf project on your target VS Code/macOS installation.
+
 ### Invisible Mode
 > [!WARNING]
 > This feature is not considered robust yet, and may not work as expected, especially under unstable network environment.

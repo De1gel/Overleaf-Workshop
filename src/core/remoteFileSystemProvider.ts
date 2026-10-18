@@ -131,6 +131,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
+    private localReplicaBaseUri?: vscode.Uri;
+    private localReplicaStopped = false;
 
     public readonly origin: vscode.Uri;
     public readonly projectName: string;
@@ -172,6 +174,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.userId;
     }
 
+    async initLocalReplica(baseUri: vscode.Uri): Promise<void> {
+        this.localReplicaBaseUri = baseUri;
+        // A project may already have been prefetched by a command before local activation.
+        if (this.root && this.scmCollectionItem) {
+            this.scmCollectionItem.triggers.forEach(trigger => trigger.dispose());
+            const collection = new SCMCollectionProvider(this, this.context, baseUri);
+            this.scmCollectionItem = {collection, triggers: collection.triggers};
+        }
+        await this.init();
+        await this.scmCollectionItem?.collection.ready;
+    }
+
+    stopLocalReplica(): void {
+        this.localReplicaStopped = true;
+        if (this.retryTimer) { clearTimeout(this.retryTimer); }
+        this.socket.dispose();
+        this.dispose();
+    }
+
     async init() : Promise<ProjectEntity> {
         if (this.root) {
             return Promise.resolve(this.root);
@@ -197,6 +218,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 vscode.l10n.t('Reload'),
                 vscode.l10n.t('Retry'),
             ).then((choice) => {
+                if (this.localReplicaStopped) { return; }
                 if (choice === vscode.l10n.t('Reload')) {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 } else if (choice === vscode.l10n.t('Retry')) {
@@ -224,7 +246,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // Keep the notification visible while reconnecting
                 await new Promise<void>((resolve) => {
                     const check = () => {
-                        if (this.root || this.retryConnection >= MAX_RETRIES) {
+                        if (this.localReplicaStopped || this.root || this.retryConnection >= MAX_RETRIES) {
                             this.reconnectingNotification = false;
                             resolve();
                         } else {
@@ -241,6 +263,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (delayMs > 0) {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
+            if (this.localReplicaStopped) { throw new Error('Local Replica stopped'); }
 
             // Only recreate the socket when the connection scheme has changed
             // (e.g., v1→v2 after connectionRejected). For transient disconnects,
@@ -265,6 +288,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // fetch project settings
                 const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
                 project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
+                if (this.localReplicaStopped) { return project; }
                 this.root = project;
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
@@ -285,7 +309,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                         this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
                         delete this.scmCollectionItem;
                     }
-                    const scmCollection = new SCMCollectionProvider(this, this.context);
+                    const scmCollection = new SCMCollectionProvider(this, this.context, this.localReplicaBaseUri);
                     this.scmCollectionItem = {
                         collection: scmCollection,
                         triggers: scmCollection.triggers,
@@ -295,6 +319,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
                 return project;
             }).catch((err) => {
+                if (this.localReplicaStopped) { throw err; }
                 this.retryConnection += 1;
                 return this.initializingPromise;
             });
@@ -439,6 +464,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
+                if (this.localReplicaStopped) { return; }
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
                 // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
@@ -1335,6 +1361,13 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
 
     prefetch(uri: vscode.Uri): Promise<VirtualFileSystem> {
         return this.getVFS(uri).then((vfs) => {return vfs;});
+    }
+
+    releaseLocalReplica(vfs: VirtualFileSystem): void {
+        for (const [key, value] of Object.entries(this.vfss)) {
+            if (value===vfs) { delete this.vfss[key]; }
+        }
+        vfs.stopLocalReplica();
     }
 
     notify(events :vscode.FileChangeEvent[]) {

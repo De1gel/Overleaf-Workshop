@@ -75,6 +75,7 @@ export interface EventsHandler {
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 
 export class SocketIOAPI {
+    private disposed = false;
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
@@ -95,6 +96,7 @@ export class SocketIOAPI {
     }
 
     init() {
+        if (this.disposed) { return; }
         // Clean up old EventBus listeners before creating new socket
         this._cleanupEventBusListeners();
 
@@ -162,7 +164,7 @@ export class SocketIOAPI {
 
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
-        return this._socketInitScheme !== this.scheme || !this.socket;
+        return !this.disposed && (this._socketInitScheme !== this.scheme || !this.socket);
     }
 
     /** Clean up any accumulated EventBus listeners */
@@ -218,6 +220,20 @@ export class SocketIOAPI {
         this.socket.disconnect();
     }
 
+    /** Permanently release a project connection, including global event listeners. */
+    public dispose(): void {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this._cleanupEventBusListeners();
+        this._handlers = [];
+        this.record = undefined;
+        const socket = this.socket;
+        this.socket = undefined;
+        this.emit = () => Promise.reject(new Error('Socket connection disposed'));
+        try { socket?.removeAllListeners?.(); } catch {}
+        try { socket?.disconnect?.(); } catch {}
+    }
+
     get handlers() {
         return this._handlers;
     }
@@ -242,6 +258,7 @@ export class SocketIOAPI {
     }
 
     updateEventHandlers(handlers: EventsHandler) {
+        if (this.disposed) { return; }
         this._handlers.push(handlers);
         Object.values(handlers).forEach((handler) => {
             switch (handler) {

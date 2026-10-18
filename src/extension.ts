@@ -1,12 +1,12 @@
 import * as vscode from 'vscode';
 import { ROOT_NAME, ELEGANT_NAME } from './consts';
 
-import { RemoteFileSystemProvider, VirtualFileSystem } from './core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider } from './core/remoteFileSystemProvider';
 import { ProjectManagerProvider } from './core/projectManagerProvider';
 import { PdfViewEditorProvider } from './core/pdfViewEditorProvider';
 import { CompileManager } from './compile/compileManager';
 import { LangIntellisenseProvider } from './intellisense';
-import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
+import { LocalReplicaActivation } from './scm/localReplicaActivation';
 
 export function activate(context: vscode.ExtensionContext) {
     // Register: [core] RemoteFileSystemProvider
@@ -29,23 +29,9 @@ export function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
-    // activate vfs for local replica
-    LocalReplicaSCMProvider.readSettings()
-    .then(async setting => {
-        if (setting?.uri) {
-            const uri = vscode.Uri.parse(setting.uri);
-            if (uri.scheme===ROOT_NAME) {
-                // activate vfs
-                const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
-                await vfs.init();
-                vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activate`, true);
-                // activate compile & preview
-                if (setting?.enableCompileNPreview) {
-                    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, true);
-                }
-            }
-        }
-    });
+    const localReplica = new LocalReplicaActivation(remoteFileSystemProvider);
+    context.subscriptions.push(localReplica);
+    void localReplica.start();
 }
 
 export function deactivate() {

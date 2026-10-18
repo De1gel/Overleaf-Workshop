@@ -59,6 +59,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onFileSystem:overleaf-workshop",
     "workspaceContains:.overleaf/settings.json"
   ],
@@ -435,6 +436,13 @@
           "default": false,
           "scope": "resource",
           "markdownDescription": "%configuration.localReplica.syncOnFileChange.enabled.markdownDescription%"
+        },
+        "overleaf-workshop.localReplica.paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "%configuration.localReplica.paths.markdownDescription%"
         },
         "overleaf-workshop.compileOutputFolderName": {
           "type": "string",
