@@ -1,30 +1,22 @@
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
+import { createHash } from 'crypto';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
-import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
+import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
-type FileCache = {date:number, hash:number};
+type WatchSession = {disposed: boolean, disposables: vscode.Disposable[]};
 
-/**
- * Returns a hash code from a string
- * @param  {String} str The string to hash.
- * @return {Number}    A 32bit integer
- * @see http://werxltd.com/wp/2010/05/13/javascript-implementation-of-javas-string-hashcode-method/
- */
-function hashCode(content?: Uint8Array): number {
-    if (content===undefined) { return -1; }
-    const str = new TextDecoder().decode(content);
+function sameContent(left?: Uint8Array, right?: Uint8Array): boolean {
+    return left===right || (left!==undefined && right!==undefined
+        && left.length===right.length && left.every((byte, index) => byte===right[index]));
+}
 
-    let hash = 0;
-    for (let i = 0, len = str.length; i < len; i++) {
-        const chr = str.charCodeAt(i);
-        hash = (hash << 5) - hash + chr;
-        hash |= 0; // Convert to 32bit integer
-    }
-    return hash;
+function isFileNotFound(error: unknown): boolean {
+    const code = (error as {code?: string})?.code;
+    return code==='FileNotFound' || code==='ENOENT';
 }
 
 /**
@@ -36,10 +28,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
-    private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
+    private bypassCache: Map<string, string|undefined> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
+    private watchSession?: WatchSession;
+    private watchLifecycle?: vscode.Disposable;
+    private triggerPromise?: Promise<vscode.Disposable[]>;
+    private syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private syncQueues = new Map<string, Promise<void>>();
+    private activeSyncs = 0;
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -157,6 +155,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private matchIgnorePatterns(path: string): boolean {
+        // Replica metadata must stay local even when custom patterns replace defaults.
+        if (path.split('/').some(part => ['.overleaf', '.git', '.vscode'].includes(part))) {
+            return true;
+        }
         const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
         for (const pattern of ignorePatterns) {
             if (minimatch(path, pattern, {dot:true})) {
@@ -166,47 +168,73 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
-    private setBypassCache(relPath: string, content?: Uint8Array, action?: 'push'|'pull') {
-        const date = Date.now();
-        const hash = hashCode(content);
-        const cache = this.bypassCache.get(relPath) || [undefined,undefined];
-        // update the push/pull cache
-        if (action==='push') {
-            cache[0] = {date, hash};
-            cache[1] = cache[1] ?? {date, hash};
-        } else if (action==='pull') {
-            cache[1] = {date, hash};
-            cache[0] = cache[0] ?? {date, hash};
-        } else {
-            cache[0] = {date, hash};
-            cache[1] = {date, hash};
-        }
-        // write back to the cache
-        this.bypassCache.set(relPath, cache as [FileCache,FileCache]);
+    private setBypassCache(relPath: string, content?: Uint8Array) {
+        this.bypassCache.set(relPath, content===undefined ? undefined : createHash('sha256').update(content).digest('hex'));
     }
 
-    private shouldPropagate(action: 'push'|'pull', relPath: string, content?: Uint8Array): boolean {
-        const now = Date.now();
-        const cache = this.bypassCache.get(relPath);
-        if (cache) {
-            const thisHash = hashCode(content);
-            // console.log(action, relPath, `[${cache[0].hash}, ${cache[1].hash}]`, thisHash);
-            if (action==='push' && cache[0].hash===thisHash) { return false; }
-            if (action==='pull' && cache[1].hash===thisHash) { return false; }
-            if (cache[0].hash!==cache[1].hash) {
-                if (action==='push' && now-cache[0].date<500 || action==='pull' && now-cache[1].date<500) {
-                    this.setBypassCache(relPath, content, action);
+    private shouldPropagate(relPath: string, content?: Uint8Array): boolean {
+        const fingerprint = content===undefined ? undefined : createHash('sha256').update(content).digest('hex');
+        return !this.bypassCache.has(relPath) || this.bypassCache.get(relPath)!==fingerprint;
+    }
+
+    private relativeSyncPath(uri: vscode.Uri, root: vscode.Uri): string|undefined {
+        if (uri.scheme!==root.scheme || uri.authority!==root.authority) { return undefined; }
+        const prefix = root.path.replace(/\/+$/, '') + '/';
+        if (!uri.path.startsWith(prefix) || uri.path===prefix) { return undefined; }
+        const parts = uri.path.slice(prefix.length).split('/');
+        if (parts.some(part => part==='.' || part==='..')) { return undefined; }
+        return '/' + parts.join('/').replace(/\/+$/, '');
+    }
+
+    private async hasLocalSymbolicLink(relPath: string): Promise<boolean> {
+        let uri = this.baseUri;
+        for (const part of relPath.split('/').filter(Boolean)) {
+            uri = vscode.Uri.joinPath(uri, part);
+            try {
+                if ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.SymbolicLink) {
                     return true;
                 }
-                this.setBypassCache(relPath, content, action);
-                return false;
+            } catch (error) {
+                if (isFileNotFound(error)) { return false; }
+                throw error;
             }
         }
-        this.setBypassCache(relPath, content, action);
-        return true;
+        return false;
     }
 
-    private async overwrite(root: string='/'): Promise<boolean|undefined> {
+    private queueSync(action: 'push'|'pull', type: 'update'|'delete', relPath: string, fromUri: vscode.Uri, toUri: vscode.Uri): Promise<void> {
+        const session = this.watchSession;
+        if (!session || session.disposed) { return Promise.resolve(); }
+        const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
+        const next = previous.then(async () => {
+            if (!session?.disposed) {
+                await this.applySync(action, type, relPath, fromUri, toUri, session);
+            }
+        }).catch(() => {
+            // Do not include remote error payloads, which can contain authentication data.
+            console.error(`Local Replica ${action} failed: ${relPath}`);
+            this.status = {status: 'need-attention', message: `${type}: ${relPath}`};
+        });
+        this.syncQueues.set(relPath, next);
+        void next.then(() => {
+            if (this.syncQueues.get(relPath)===next) { this.syncQueues.delete(relPath); }
+        });
+        return next;
+    }
+
+    private scheduleLocalSync(uri: vscode.Uri, type: 'update'|'delete') {
+        const relPath = this.relativeSyncPath(uri, this.baseUri);
+        const session = this.watchSession;
+        if (!session || session.disposed || relPath===undefined || this.matchIgnorePatterns(relPath)) { return; }
+        const pending = this.syncTimers.get(relPath);
+        if (pending!==undefined) { clearTimeout(pending); }
+        this.syncTimers.set(relPath, setTimeout(() => {
+            this.syncTimers.delete(relPath);
+            if (!session?.disposed) { void this.syncToVFS(uri, type); }
+        }, 100));
+    }
+
+    private async overwrite(root: string='/', session?: WatchSession): Promise<boolean|undefined> {
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: vscode.l10n.t('Sync Files'),
@@ -216,10 +244,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const files: [string,string][] = [];
             const queue: string[] = [root];
             while (queue.length!==0) {
+                if (session?.disposed) { return undefined; }
                 const nextRoot = queue.shift();
                 const vfsUri = this.vfs.pathToUri(nextRoot!);
                 const items = await vscode.workspace.fs.readDirectory(vfsUri);
-                if (token.isCancellationRequested) { return undefined; }
+                if (token.isCancellationRequested || session?.disposed) { return undefined; }
                 //
                 for (const [name, type] of items) {
                     const relPath = nextRoot + name;
@@ -239,12 +268,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             for (let i=0; i<total; i++) {
                 const [name, relPath] = files[i];
                 const vfsUri = this.vfs.pathToUri(relPath);
-                if (token.isCancellationRequested) { return false; }
+                if (token.isCancellationRequested || session?.disposed) { return false; }
                 progress.report({increment: 100/total, message: relPath});
                 //
+                if (await this.hasLocalSymbolicLink(relPath)) { continue; }
+                if (session?.disposed) { return false; }
                 const baseContent = this.baseCache[relPath];
                 const localContent = await this.readFile(relPath);
+                if (session?.disposed) { return false; }
                 const remoteContent = await vscode.workspace.fs.readFile(vfsUri);
+                if (session?.disposed) { return false; }
                 if (baseContent===undefined || localContent===undefined) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
@@ -260,10 +293,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // write the merged content to local
                     const mergedContent = new TextEncoder().encode(mergedContentStr);
                     await this.writeFile(relPath, mergedContent);
+                    if (session?.disposed) { return false; }
                     // write the merged content to remote
                     if (localPatches.length!==0) {
                         await vscode.workspace.fs.writeFile(vfsUri, mergedContent);
                     }
+                    this.setBypassCache(relPath, mergedContent);
                 }
             }
 
@@ -277,7 +312,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return true;
         }
         // synchronization propagation check
-        if (!this.shouldPropagate(action, relPath, content)) {
+        if (!this.shouldPropagate(relPath, content)) {
             return true;
         }
         // otherwise, log the synchronization
@@ -285,56 +320,85 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
-    private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
+    private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri, session?: WatchSession) {
+        if (this.matchIgnorePatterns(relPath) || await this.hasLocalSymbolicLink(relPath) || session?.disposed) { return; }
+        this.activeSyncs++;
         this.status = {status: action, message: `${type}: ${relPath}`};
-
-        await (async () => {
-            if (type==='delete') {
-                const newContent = undefined;
-                if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                delete this.baseCache[relPath];
-                await vscode.workspace.fs.delete(toUri, {recursive:true});
-            } else {
-                const stat = await vscode.workspace.fs.stat(fromUri);
-                if (stat.type===vscode.FileType.Directory) {
-                    const newContent = new Uint8Array();
-                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                    await vscode.workspace.fs.createDirectory(toUri);
-                }
-                else if (stat.type===vscode.FileType.File) {
-                    try {
-                        const newContent = await vscode.workspace.fs.readFile(fromUri);
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                        await vscode.workspace.fs.writeFile(toUri, newContent);
-                        this.baseCache[relPath] = newContent;
-                        if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
-                    } catch (error) {
-                        console.error(error);
-                    }
-                }
-                else {
-                    console.error(`Unknown file type: ${stat.type}`);
-                }
+        let failed = false;
+        try {
+            // The final on-disk state wins over event ordering (including delete/create
+            // bursts produced by atomic saves). A vanished update becomes a deletion.
+            let stat: vscode.FileStat|undefined;
+            try {
+                stat = await vscode.workspace.fs.stat(fromUri);
+            } catch (error) {
+                if (!isFileNotFound(error)) { throw error; }
             }
-        })();
-
-        this.status = {status: 'idle', message: ''};
+            if (session?.disposed) { return; }
+            if (stat===undefined) {
+                if (this.bypassSync(action, 'delete', relPath)) { return; }
+                try {
+                    await vscode.workspace.fs.delete(toUri, {recursive:true});
+                } catch (error) {
+                    if (!isFileNotFound(error)) { throw error; }
+                }
+                delete this.baseCache[relPath];
+                for (const path of Object.keys(this.baseCache)) {
+                    if (path.startsWith(relPath + '/')) { delete this.baseCache[path]; }
+                }
+                for (const path of this.bypassCache.keys()) {
+                    if (path.startsWith(relPath + '/')) { this.bypassCache.set(path, undefined); }
+                }
+                this.setBypassCache(relPath);
+            } else if (stat.type===vscode.FileType.Directory) {
+                this.bypassCache.delete(relPath);
+                try {
+                    const targetStat = await vscode.workspace.fs.stat(toUri);
+                    if (targetStat.type===vscode.FileType.Directory) { return; }
+                } catch (error) {
+                    if (!isFileNotFound(error)) { throw error; }
+                }
+                if (session?.disposed) { return; }
+                await vscode.workspace.fs.createDirectory(toUri);
+            } else if (stat.type===vscode.FileType.File) {
+                const newContent = await vscode.workspace.fs.readFile(fromUri);
+                if (session?.disposed || this.bypassSync(action, 'update', relPath, newContent)) { return; }
+                let targetContent: Uint8Array|undefined;
+                try {
+                    targetContent = await vscode.workspace.fs.readFile(toUri);
+                } catch (error) {
+                    if (!isFileNotFound(error)) { throw error; }
+                }
+                if (session?.disposed) { return; }
+                if (!sameContent(newContent, targetContent)) {
+                    await vscode.workspace.fs.writeFile(toUri, newContent);
+                }
+                if (session?.disposed) { return; }
+                this.baseCache[relPath] = newContent;
+                this.setBypassCache(relPath, newContent);
+                if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
+            }
+        } catch (error) {
+            failed = true;
+            throw error;
+        } finally {
+            this.activeSyncs--;
+            if (!failed && this.activeSyncs===0) { this.status = {status: 'idle', message: ''}; }
+        }
     }
 
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
-        const {pathParts} = parseUri(vfsUri);
-        pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
-        const relPath = ('/' + pathParts.join('/'));
+        const relPath = this.relativeSyncPath(vfsUri, this.vfs.origin);
+        if (relPath===undefined || vfsUri.query!==this.vfs.origin.query || this.matchIgnorePatterns(relPath)) { return; }
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        await this.queueSync('pull', type, relPath, vfsUri, localUri);
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
-        // get relative path to baseUri
-        const basePath = this.baseUri.path;
-        const relPath = localUri.path.slice(basePath.length);
+        const relPath = this.relativeSyncPath(localUri, this.baseUri);
+        if (relPath===undefined || this.matchIgnorePatterns(relPath)) { return; }
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        await this.queueSync('push', type, relPath, localUri, vfsUri);
     }
 
     /**
@@ -344,59 +408,83 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * This is the general fix for issues #299 and #323.
      */
     private onDocumentSaved(doc: vscode.TextDocument) {
-        const docUri = doc.uri;
-        // Only sync files within our baseUri (ensure path separator boundary)
-        const basePath = this.baseUri.path.endsWith('/') ? this.baseUri.path : this.baseUri.path + '/';
-        if (!docUri.path.startsWith(basePath)) { return; }
-        this.syncToVFS(docUri, 'update');
+        this.scheduleLocalSync(doc.uri, 'update');
     }
 
     private async initWatch() {
-        // write ".overleaf/settings.json" if not exist
-        const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
+        const session: WatchSession = {disposed: false, disposables: []};
+        this.watchSession = session;
+        const lifecycle = new vscode.Disposable(() => {
+            if (session.disposed) { return; }
+            session.disposed = true;
+            session.disposables.forEach(disposable => disposable.dispose());
+            if (this.watchSession===session) {
+                this.syncTimers.forEach(timer => clearTimeout(timer));
+                this.syncTimers.clear();
+                this.bypassCache.clear();
+                this.watchSession = undefined;
+                this.watchLifecycle = undefined;
+                this.triggerPromise = undefined;
+                this.vfsWatcher = undefined;
+                this.localWatcher = undefined;
+            }
+        });
+        this.watchLifecycle = lifecycle;
         try {
-            await vscode.workspace.fs.stat(settingUri);
+            // Keep the existing settings format when creating a new replica.
+            const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
+            if (await this.hasLocalSymbolicLink('/.overleaf/settings.json')) {
+                throw new Error('Local Replica metadata cannot use symbolic links');
+            }
+            if (session.disposed) { return []; }
+            try {
+                await vscode.workspace.fs.stat(settingUri);
+            } catch (error) {
+                if (!isFileNotFound(error)) { throw error; }
+                if (session.disposed) { return []; }
+                await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.baseUri, '.overleaf'));
+                if (session.disposed) { return []; }
+                await vscode.workspace.fs.writeFile(settingUri, Buffer.from(
+                    JSON.stringify({
+                        'uri': this.vfs.origin.toString(),
+                        'serverName': this.vfs.serverName,
+                        'enableCompileNPreview': false,
+                        'projectName': this.vfs.projectName,
+                    }, null, 4)
+                ));
+            }
+            if (session.disposed) { return []; }
+            this.vfsWatcher = vscode.workspace.createFileSystemWatcher(
+                new vscode.RelativePattern(this.vfs.origin, '**/*')
+            );
+            session.disposables.push(this.vfsWatcher);
+            this.localWatcher = vscode.workspace.createFileSystemWatcher(
+                new vscode.RelativePattern(this.baseUri, '**/*')
+            );
+            session.disposables.push(this.localWatcher);
+            await this.overwrite('/', session);
+            if (session.disposed) { return []; }
+
+            const syncOnFileChange = vscode.workspace
+                .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange', this.baseUri)
+                .get<boolean>('enabled', false);
+
+            session.disposables.push(
+                this.vfsWatcher.onDidChange(uri => this.syncFromVFS(uri, 'update')),
+                this.vfsWatcher.onDidCreate(uri => this.syncFromVFS(uri, 'update')),
+                this.vfsWatcher.onDidDelete(uri => this.syncFromVFS(uri, 'delete')),
+                vscode.workspace.onDidSaveTextDocument(doc => this.onDocumentSaved(doc)),
+                this.localWatcher.onDidCreate(uri => this.scheduleLocalSync(uri, 'update')),
+                this.localWatcher.onDidDelete(uri => this.scheduleLocalSync(uri, 'delete')),
+            );
+            if (syncOnFileChange) {
+                session.disposables.push(this.localWatcher.onDidChange(uri => this.scheduleLocalSync(uri, 'update')));
+            }
+            return [lifecycle];
         } catch (error) {
-            await vscode.workspace.fs.writeFile(settingUri, Buffer.from(
-                JSON.stringify({
-                    'uri': this.vfs.origin.toString(),
-                    'serverName': this.vfs.serverName,
-                    'enableCompileNPreview': false,
-                    'projectName': this.vfs.projectName,
-                }, null, 4)
-            ));
+            lifecycle.dispose();
+            throw error;
         }
-
-        this.vfsWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern( this.vfs.origin, '**/*' )
-        );
-        this.localWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern( this.baseUri.path, '**/*' )
-        );
-        await this.overwrite();
-
-        const syncOnFileChange = vscode.workspace
-            .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange')
-            .get<boolean>('enabled', false);
-
-        // By default, only explicit editor saves push file modifications. Users who
-        // rely on external tools can opt into file-system change events instead.
-        // Keep these listeners mutually exclusive so an editor save is not pushed twice.
-        const localChangeListener = syncOnFileChange
-            ? this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update'))
-            : vscode.workspace.onDidSaveTextDocument(doc => this.onDocumentSaved(doc));
-
-        return [
-            // sync from vfs to local
-            this.vfsWatcher.onDidChange(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidCreate(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidDelete(async uri => await this.syncFromVFS(uri, 'delete')),
-            // sync from local to vfs: file updates use the configured listener above;
-            // file creation and deletion still always use the file-system watcher
-            localChangeListener,
-            this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
-            this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
-        ];
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {
@@ -417,17 +505,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     get triggers(): Promise<vscode.Disposable[]> {
-        return this.initWatch().then((watches) => {
-            if (this.vfsWatcher!==undefined && this.localWatcher!==undefined) {
-                return [
-                    this.vfsWatcher,
-                    this.localWatcher,
-                    ...watches,
-                ];
-            } else {
-                return [];
-            }
-        });
+        this.triggerPromise ??= this.initWatch();
+        return this.triggerPromise;
+    }
+
+    public dispose(): void {
+        this.watchLifecycle?.dispose();
     }
 
     public static get baseUriInputBox(): vscode.QuickPick<vscode.QuickPickItem> {
