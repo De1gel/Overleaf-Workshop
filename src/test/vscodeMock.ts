@@ -101,6 +101,11 @@ function missing(uri: Uri) {
     error.code = 'FileNotFound';
     return error;
 }
+function unavailable(value?: string | Uri) {
+    const error = new Error(typeof value === 'string' ? value : value?.path || 'Unavailable') as Error & {code: string};
+    error.code = 'Unavailable';
+    return error;
+}
 
 type Entry = {type: number; data: Uint8Array};
 type Operation = {type: 'write' | 'delete' | 'mkdir'; uri: Uri; data?: Uint8Array};
@@ -239,7 +244,8 @@ export const mockVscode = {
         appendMarkdown(value: string) { this.value += value; return this; }
     },
     FileType: {Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64},
-    FileSystemError: {FileNotFound: missing},
+    FileChangeType: {Changed: 1, Created: 2, Deleted: 3},
+    FileSystemError: {FileNotFound: missing, Unavailable: unavailable},
     StatusBarAlignment: {Left: 1},
     ProgressLocation: {Notification: 15},
     QuickPickItemKind: {Separator: -1},
@@ -318,7 +324,10 @@ export function installModuleMocks() {
             }};
         }
         if (request.endsWith('/utils/globalStateManager')) {
-            return {GlobalStateManager: {getServerProjectSCMPersists: () => state.persists}};
+            return {GlobalStateManager: {
+                getServerProjectSCMPersists: () => state.persists,
+                authenticate: async () => ({csrfToken: 'test-csrf-token', cookies: 'session=test-session'}),
+            }};
         }
         if (request === './historyViewProvider') {
             return {HistoryViewProvider: class { readonly triggers: Disposable[] = []; }};

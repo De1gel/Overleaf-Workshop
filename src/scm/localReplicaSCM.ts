@@ -356,9 +356,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await vscode.workspace.fs.writeFile(toUri, newContent);
                 }
                 if (session?.disposed) { return; }
+                if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
+                if (session?.disposed) { return; }
                 this.baseCache[relPath] = newContent;
                 this.setBypassCache(relPath, newContent);
-                if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
             }
         } catch (error) {
             failed = true;

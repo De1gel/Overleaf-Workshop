@@ -710,6 +710,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
+        } else {
+            // A failed creation must reject the filesystem write, so sync can retry it.
+            throw vscode.FileSystemError.Unavailable(vscode.l10n.t('Failed to create "{fileName}" on Overleaf.', {fileName}));
         }
     }
 
