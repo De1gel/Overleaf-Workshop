@@ -1,0 +1,38 @@
+--- a/out/scm/localReplicaSCM.js
++++ b/out/scm/localReplicaSCM.js
+@@ -187,25 +187,31 @@
+         const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
+         // Missing files refresh the project snapshot before creation. Do not reset
+         // that transport while another local push is still using it.
+         const previousPush = action === 'push' ? this.pushSyncQueue : Promise.resolve();
+         const next = Promise.all([previous.catch(() => {}), previousPush.catch(() => {})]).then(async () => {
+-            for (let attempt = 0; attempt < 3; attempt++) {
+-                if (session.disposed) { return false; }
++            const busyDeadline = Date.now() + 15000;
++            while (!session.disposed) {
+                 try {
+                     if (action === 'push' && !this.remoteUpdates.hasPending(relPath)) {
+                         await this.preparePush(relPath, fromUri, toUri, session);
+                     }
+                     await this.applySync(action, type, relPath, fromUri, toUri, session);
+                     return true;
+                 } catch (error) {
+                     // Only retry the provider's own busy-snapshot condition. HTTP
+                     // upload failures have their own bounded transport retry policy.
+-                    if (attempt === 2 || error?.message !== 'Remote changes are waiting to be uploaded; retry the snapshot later') {
++                    if (error?.message !== 'Remote changes are waiting to be uploaded; retry the snapshot later'
++                        || Date.now() >= busyDeadline) {
+                         throw error;
+                     }
+-                    await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
++                    // Let active writes finish naturally. Poll cancellation while
++                    // waiting; do not reset the transport or bypass pending review.
++                    const retryAt = Math.min(Date.now() + 250, busyDeadline);
++                    while (!session.disposed && Date.now() < retryAt) {
++                        await new Promise(resolve => setTimeout(resolve, Math.min(50, retryAt - Date.now())));
++                    }
+                 }
+             }
+             return false;
+         }).catch(error => {
+             const code = typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,48}$/.test(error.code)

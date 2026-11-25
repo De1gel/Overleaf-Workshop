@@ -18,6 +18,7 @@ function fixture(filename, options = {}) {
   let uploadFailures = options.uploadFailures || 0;
   let directoryFailures = options.directoryFailures || 0;
   let refreshFailures = options.refreshFailures || 0;
+  const refreshBusyUntil = Date.now() + (options.refreshBusyMs || 0);
   let refreshes = 0;
   let provider;
   const uri = (scheme, name) => ({ scheme, path: name, query: '', toString() { return scheme + ':' + name; } });
@@ -79,7 +80,8 @@ function fixture(filename, options = {}) {
     readRemoteFile: value => fs.readFile(value),
     async refreshRemoteSnapshot() {
       refreshes++;
-      if (provider.activeSyncs > 0 || refreshFailures-- > 0) {
+      options.onRefresh?.();
+      if (provider.activeSyncs > 0 || refreshFailures-- > 0 || Date.now() < refreshBusyUntil) {
         throw new Error('Remote changes are waiting to be uploaded; retry the snapshot later');
       }
     },
@@ -171,6 +173,43 @@ for (const [label, filename] of implementations) {
       assert.equal(f.writes.length, 0);
       assert.equal(f.creations.length, 0);
       assert.equal(f.provider.baseCache['/abstract/isttt27.bst'], undefined);
+    });
+
+    test(`${label}: snapshot busy beyond the old 300 ms window is allowed to finish`, async () => {
+      const f = fixture(filename, { refreshBusyMs: 650 });
+      const file = f.addFile('/abstract/isttt27.sty', 'package bytes');
+      assert.equal(await f.provider.syncToVFS(file, 'update'), true);
+      assert.deepEqual(f.writes, ['/project/abstract/isttt27.sty']);
+      assert.equal(Buffer.from(f.provider.baseCache['/abstract/isttt27.sty']).toString(), 'package bytes');
+    });
+
+    test(`${label}: cancelling a session stops busy waiting without uploading`, async () => {
+      const f = fixture(filename, { refreshBusyMs: 5000 });
+      const file = f.addFile('/abstract/isttt27.sty', 'package bytes');
+      const started = Date.now();
+      const pending = f.provider.syncToVFS(file, 'update');
+      const cancellation = setTimeout(() => { f.provider.watchSession.disposed = true; }, 40);
+      try {
+        assert.equal(await pending, false);
+      } finally {
+        clearTimeout(cancellation);
+      }
+      assert.ok(Date.now() - started < 1000, 'cancellation must not wait for the busy deadline');
+      assert.equal(f.writes.length, 0);
+      assert.equal(f.recorded.length, 0);
+    });
+
+    test(`${label}: an exhausted busy deadline leaves the upload pending for a later retry`, async t => {
+      let now = 0;
+      t.mock.method(Date, 'now', () => now);
+      const f = fixture(filename, { refreshBusyMs: 60000, onRefresh: () => { now += 15000; } });
+      const file = f.addFile('/abstract/isttt27.sty', 'package bytes');
+      assert.equal(await f.provider.syncToVFS(file, 'update'), false);
+      assert.equal(f.provider.status.status, 'need-attention');
+      assert.equal(f.writes.length, 0);
+      assert.equal(f.recorded.length, 0);
+      assert.equal(f.provider.baseCache['/abstract/isttt27.sty'], undefined);
+      assert.equal(f.provider.bypassCache.has('/abstract/isttt27.sty'), false);
     });
   }
 }
