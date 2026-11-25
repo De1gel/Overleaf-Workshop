@@ -661,6 +661,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
 
         let res = undefined;
+        let failure: {statusCode?: number} | undefined;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
 
         if (content.length===0) {
@@ -668,23 +669,25 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (_res.type==='success') {
                 res = _res.entity;
             }
+            failure = _res;
         } else {
             const parentFolderId = parentFolder._id;
             const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
-            } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
             }
+            failure = _res;
         }
-        if (res && res._type) {
-            this.insertEntity(parentFolder, res._type, res);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
+        if (!res || !res._id || (res._type !== 'doc' && res._type !== 'file')) {
+            const statusCode = failure?.statusCode;
+            throw Object.assign(new Error(`Unable to upload "${fileName}"${statusCode ? ` (HTTP ${statusCode})` : ''}.`), {
+                code: 'RemoteUploadFailed', statusCode,
+            });
         }
+        this.insertEntity(parentFolder, res._type, res);
+        this.notify([
+            {type: vscode.FileChangeType.Created, uri: uri},
+        ]);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -892,20 +895,23 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async mkdir(uri: vscode.Uri) {
-        const {parentFolder, fileName} = await this._resolveUri(uri);
+        const {parentFolder, fileName, fileType} = await this._resolveUri(uri);
+        if (fileType === 'folder') { return; }
+        if (fileType) { throw vscode.FileSystemError.FileExists(uri); }
         const [folderName, parentFolderId] = [fileName, parentFolder._id];
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.addFolder(identity, this.projectId, folderName, parentFolderId);
 
-        if (res.type==='success' && res.entity!==undefined) {
+        if (res.type==='success' && res.entity?._id) {
             this.insertEntity(parentFolder, 'folder', res.entity as FolderEntity);
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
         } else {
-            if (res.message!==undefined) {
-                vscode.window.showErrorMessage(res.message);
-            }
+            const statusCode = res.statusCode;
+            throw Object.assign(new Error(`Unable to create remote folder "${folderName}"${statusCode ? ` (HTTP ${statusCode})` : ''}.`), {
+                code: 'RemoteDirectoryCreateFailed', statusCode,
+            });
         }
     }
 
