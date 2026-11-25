@@ -1,6 +1,6 @@
 # File upload regression tests
 
-Run with Node.js 20 or newer:
+Run with Node.js 24 (the locked undici dependency requires Node.js 22.19 or newer):
 
 ```sh
 npm ci --ignore-scripts
