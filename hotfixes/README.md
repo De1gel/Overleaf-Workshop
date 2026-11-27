@@ -1,3 +1,7 @@
+# Local Replica fixes
+
+Build and test the integrated release with the [VSIX packaging instructions](reviewed-vsix.md).
+
 # Existing snapshot-review hotfix installations
 
 `local-replica-snapshot-busy.patch` applies to the compiled Local Replica
