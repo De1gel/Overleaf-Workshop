@@ -1,0 +1,23 @@
+name: Test file uploads
+
+on:
+  push:
+    branches: [fix/local-replica-file-uploads]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  upload-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npx tsc -p tsconfig.json --noEmit
+      - run: npm run test:upload

@@ -38,6 +38,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
+    private syncQueues = new Map<string, Promise<void>>();
+    private pushSyncQueue: Promise<void> = Promise.resolve();
+    private remoteDirectoryTasks = new Map<string, Promise<void>>();
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
     private ignorePatterns: string[] = [
@@ -285,40 +288,105 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
+    private async ensureRemoteDirectory(relPath: string): Promise<void> {
+        let currentPath = '';
+        for (const part of relPath.split('/').filter(Boolean)) {
+            currentPath += '/' + part;
+            const path = currentPath;
+            let task = this.remoteDirectoryTasks.get(path);
+            if (!task) {
+                task = (async () => {
+                    const uri = this.vfs.pathToUri(path);
+                    try {
+                        const stat = await vscode.workspace.fs.stat(uri);
+                        if (stat.type !== vscode.FileType.Directory) {
+                            throw vscode.FileSystemError.FileNotADirectory(uri);
+                        }
+                        return;
+                    } catch (error: any) {
+                        if (error?.code !== 'FileNotFound' && error?.code !== 'ENOENT') { throw error; }
+                    }
+                    await vscode.workspace.fs.createDirectory(uri);
+                    if ((await vscode.workspace.fs.stat(uri)).type !== vscode.FileType.Directory) {
+                        throw vscode.FileSystemError.FileNotADirectory(uri);
+                    }
+                })();
+                this.remoteDirectoryTasks.set(path, task);
+            }
+            try { await task; }
+            finally {
+                if (this.remoteDirectoryTasks.get(path) === task) { this.remoteDirectoryTasks.delete(path); }
+            }
+        }
+    }
+
+    private queueSync(action: 'push'|'pull', type: 'update'|'delete', relPath: string,
+        fromUri: vscode.Uri, toUri: vscode.Uri): Promise<void> {
+        // A directory and its children arrive as separate watcher events. Serialize
+        // pushes for the replica, not just for the individual file.
+        const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
+        const previousPush = action === 'push' ? this.pushSyncQueue : Promise.resolve();
+        const next = Promise.all([previous.catch(() => {}), previousPush.catch(() => {})])
+            .then(() => this.applySync(action, type, relPath, fromUri, toUri))
+            .catch((error: any) => {
+                // Never print an HTTP response body or credentials into the log.
+                const code = typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,48}$/.test(error.code)
+                    ? error.code : 'RemoteOperationFailed';
+                const status = Number.isInteger(error?.statusCode) && error.statusCode >= 100 && error.statusCode <= 599
+                    ? `, HTTP ${error.statusCode}` : '';
+                console.error(`Local Replica ${action} failed: ${relPath} (${code}${status})`);
+                this.status = {status: 'need-attention', message: `${type}: ${relPath}`};
+            });
+        this.syncQueues.set(relPath, next);
+        if (action === 'push') { this.pushSyncQueue = next; }
+        void next.then(() => {
+            if (this.syncQueues.get(relPath) === next) { this.syncQueues.delete(relPath); }
+        });
+        return next;
+    }
+
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
-
-        await (async () => {
+        // shouldPropagate records an echo-suppression fingerprint before transport.
+        // Restore it on failure so an unchanged file can be retried on the next save.
+        const oldBypass = this.bypassCache.get(relPath)?.map(item => item && {...item}) as [FileCache, FileCache] | undefined;
+        let failed = false;
+        try {
             if (type==='delete') {
-                const newContent = undefined;
-                if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                delete this.baseCache[relPath];
+                if (this.bypassSync(action, type, relPath)) { return; }
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
+                delete this.baseCache[relPath];
             } else {
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
                     const newContent = new Uint8Array();
                     if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                    await vscode.workspace.fs.createDirectory(toUri);
-                }
-                else if (stat.type===vscode.FileType.File) {
-                    try {
-                        const newContent = await vscode.workspace.fs.readFile(fromUri);
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                        await vscode.workspace.fs.writeFile(toUri, newContent);
-                        this.baseCache[relPath] = newContent;
-                        if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
-                    } catch (error) {
-                        console.error(error);
+                    if (action === 'push') {
+                        await this.ensureRemoteDirectory(relPath);
+                    } else {
+                        await vscode.workspace.fs.createDirectory(toUri);
                     }
-                }
-                else {
-                    console.error(`Unknown file type: ${stat.type}`);
+                } else if (stat.type===vscode.FileType.File) {
+                    const newContent = await vscode.workspace.fs.readFile(fromUri);
+                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                    if (action === 'push') {
+                        await this.ensureRemoteDirectory(relPath.slice(0, relPath.lastIndexOf('/')));
+                    }
+                    await vscode.workspace.fs.writeFile(toUri, newContent);
+                    if (action==='push') { await vscode.workspace.fs.readFile(toUri); }
+                    this.baseCache[relPath] = newContent;
+                } else {
+                    throw new Error('Unsupported file type');
                 }
             }
-        })();
-
-        this.status = {status: 'idle', message: ''};
+        } catch (error) {
+            failed = true;
+            if (oldBypass) { this.bypassCache.set(relPath, oldBypass); }
+            else { this.bypassCache.delete(relPath); }
+            throw error;
+        } finally {
+            if (!failed) { this.status = {status: 'idle', message: ''}; }
+        }
     }
 
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
@@ -326,7 +394,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        return this.queueSync('pull', type, relPath, vfsUri, localUri);
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -334,7 +402,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        return this.queueSync('push', type, relPath, localUri, vfsUri);
     }
 
     /**
