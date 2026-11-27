@@ -82,6 +82,15 @@ class RemoteUpdateManager {
             this.updateStatus();
             return;
         }
+        if (local.disk !== undefined && local.dirty === undefined &&
+            this.owner.canRecoverLocalEdit?.(relPath, content)) {
+            this.pending.delete(relPath);
+            if (!this.pending.size) {
+                this.deferred = false;
+            }
+            this.updateStatus();
+            return;
+        }
         const previous = this.pending.get(relPath);
         const hash = fingerprint(content);
         this.pending.set(relPath, { relPath, content: content === undefined ? undefined : new Uint8Array(content), hash });

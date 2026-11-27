@@ -8,6 +8,9 @@ const _1 = require(".");
 const localReplicaSettings_1 = require("./localReplicaSettings");
 const remoteUpdateManager_1 = require("./remoteUpdateManager");
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+function contentHash(content) {
+    return (0, crypto_1.createHash)('sha256').update(content).digest('hex');
+}
 function sameContent(left, right) {
     return left === right || (left !== undefined && right !== undefined
         && left.length === right.length && left.every((byte, index) => byte === right[index]));
@@ -34,7 +37,10 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
         this.remoteDirectoryTasks = new Map();
         this.activeSyncs = 0;
         this.knownRemotePaths = new Set();
+        this.syncedHashes = new Map();
         this.manifestWrite = Promise.resolve();
+        this.manifestVersion = 0;
+        this.persistedManifestVersion = 0;
         this.ignorePatterns = [
             '**/.*',
             '**/.*/**',
@@ -301,6 +307,50 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
         }
         await Promise.all(uploads);
     }
+    matchesSyncedContent(relPath, content) {
+        if (content === undefined) { return false; }
+        const hash = this.syncedHashes.get(relPath);
+        return hash === undefined ? sameContent(content, this.baseCache[relPath]) : hash === contentHash(content);
+    }
+    canRecoverLocalEdit(relPath, remote) {
+        return !!this.watchSession?.syncOnFileChange && !this.manualSyncEvents &&
+            this.matchesSyncedContent(relPath, remote) &&
+            !this.vfs.isRemoteEditorDirty?.(this.vfs.pathToUri(relPath));
+    }
+    async reconcileLocalEdits(session) {
+        for (const [relPath, hash] of this.syncedHashes) {
+            if (session.disposed || this.manualSyncEvents) { return; }
+            if (this.syncQueues.has(relPath) || this.syncTimers.has(relPath) ||
+                this.matchIgnorePatterns(relPath) || await this.hasLocalSymbolicLink(relPath)) {
+                continue;
+            }
+            const uri = vscode.Uri.joinPath(this.baseUri, relPath);
+            let stat;
+            try { stat = await vscode.workspace.fs.stat(uri); }
+            catch (error) {
+                if (isFileNotFound(error)) { continue; }
+                throw error;
+            }
+            if (stat.type !== vscode.FileType.File) { continue; }
+            const local = await this.remoteUpdates.localState(relPath);
+            if (session.disposed || this.manualSyncEvents) { return; }
+            if (local.dirty !== undefined || local.disk === undefined || contentHash(local.disk) === hash) {
+                continue;
+            }
+            // A cancelled manual review may have staged a local-only edit.
+            // Recheck the cloud before reconsidering that entry.
+            if (this.remoteUpdates.hasPending(relPath)) {
+                const pending = this.remoteUpdates.pending.get(relPath);
+                if (!pending || !this.canRecoverLocalEdit(relPath, pending.content)) { continue; }
+                const remote = await this.freshRemoteContent(this.vfs.pathToUri(relPath));
+                if (session.disposed || this.manualSyncEvents) { return; }
+                if (this.remoteUpdates.pending.get(relPath) !== pending) { continue; }
+                await this.remoteUpdates.queue(relPath, remote);
+                if (this.remoteUpdates.hasPending(relPath)) { continue; }
+            }
+            await this.syncToVFS(uri, 'update', { skipMissing: true, snapshotChecked: true });
+        }
+    }
     async loadSyncManifest() {
         const uri = vscode.Uri.joinPath(this.baseUri, '.overleaf/remote-sync-state.json');
         if (await this.hasLocalSymbolicLink('/.overleaf/remote-sync-state.json')) {
@@ -308,9 +358,15 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
         }
         try {
             const state = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)));
+            const project = contentHash(this.vfs.origin.toString());
+            if (state.project !== undefined && state.project !== project) { return; }
             if (Array.isArray(state.paths)) {
                 this.knownRemotePaths = new Set(state.paths.filter(path => typeof path === 'string' && path.startsWith('/')
                     && !path.split('/').some(part => part === '.' || part === '..') && !this.matchIgnorePatterns(path)));
+            }
+            if (state.project === project && state.hashes && typeof state.hashes === 'object') {
+                this.syncedHashes = new Map(Object.entries(state.hashes).filter(([path, hash]) =>
+                    this.knownRemotePaths.has(path) && typeof hash === 'string' && /^[0-9a-f]{64}$/.test(hash)));
             }
         }
         catch (error) {
@@ -320,16 +376,22 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
         }
     }
     async recordSyncedState(relPath, content) {
+        const previousHash = this.syncedHashes.get(relPath);
+        const hash = content === undefined ? undefined : contentHash(content);
         const changed = content === undefined ? this.knownRemotePaths.delete(relPath) : !this.knownRemotePaths.has(relPath);
-        if (content !== undefined) {
+        if (content === undefined) {
+            this.syncedHashes.delete(relPath);
+        } else {
             this.knownRemotePaths.add(relPath);
+            this.syncedHashes.set(relPath, hash);
         }
-        if (!changed) {
-            return;
+        if (changed || hash !== previousHash) {
+            this.manifestVersion++;
         }
+        if (this.persistedManifestVersion === this.manifestVersion) { return; }
         const session = this.watchSession;
         this.manifestWrite = this.manifestWrite.catch(() => {}).then(async () => {
-            if (!session || session.disposed) {
+            if (!session || session.disposed || this.persistedManifestVersion === this.manifestVersion) {
                 return;
             }
             if (await this.hasLocalSymbolicLink('/.overleaf/remote-sync-state.json')) {
@@ -337,9 +399,24 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
             }
             if (!session.disposed) {
                 const uri = vscode.Uri.joinPath(this.baseUri, '.overleaf/remote-sync-state.json');
-                await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify({
-                    paths: [...this.knownRemotePaths].sort(),
-                }, null, 2)));
+                const version = this.manifestVersion;
+                const paths = [...this.knownRemotePaths].sort();
+                const hashes = Object.fromEntries(paths.map(path => [path, this.syncedHashes.get(path)]));
+                const state = { project: contentHash(this.vfs.origin.toString()), paths, hashes };
+                const temporary = vscode.Uri.joinPath(this.baseUri,
+                    `/.overleaf/remote-sync-state-${(0, crypto_1.randomBytes)(6).toString('hex')}.tmp`);
+                let installed = false;
+                try {
+                    await vscode.workspace.fs.writeFile(temporary, new TextEncoder().encode(JSON.stringify(state, null, 2)));
+                    if (session.disposed) { return; }
+                    await vscode.workspace.fs.rename(temporary, uri, { overwrite: true });
+                    installed = true;
+                    this.persistedManifestVersion = version;
+                } finally {
+                    if (!installed) {
+                        await vscode.workspace.fs.delete(temporary).catch(() => {});
+                    }
+                }
             }
         });
         return this.manifestWrite;
@@ -507,7 +584,8 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
             const files = entries.map(entry => {
                 const source = push ? entry.manualLocal.dirty ?? entry.manualLocal.disk : entry.content;
                 const target = push ? entry.content : entry.manualLocal.disk;
-                const change = source === undefined ? 'Delete' : target === undefined ? 'Add' : 'Replace';
+                const change = source === undefined ? 'Delete' : target === undefined ? 'Add'
+                    : push && this.matchesSyncedContent(entry.relPath, target) ? 'Update' : 'Replace';
                 return `${change} ${entry.relPath}`;
             });
             const preview = files.sort((left, right) => Number(right.startsWith('Delete ')) - Number(left.startsWith('Delete ')));
@@ -694,10 +772,13 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
             await this.recordSyncedState(relPath, content);
             return false;
         }
-        if ((onlyAdd && remote !== undefined) || !sameContent(remote, this.baseCache[relPath])) {
+        const unchanged = remote === undefined ? !this.knownRemotePaths.has(relPath)
+            : this.matchesSyncedContent(relPath, remote);
+        if ((onlyAdd && remote !== undefined) || !unchanged) {
             await this.remoteUpdates.queue(relPath, remote);
             return false;
         }
+        this.baseCache[relPath] = remote;
         return !this.remoteUpdates.hasPending(relPath);
     }
     async mayDeleteRemoteDirectory(relPath, session) {
@@ -846,13 +927,15 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
                 if (!await this.ensureRemoteDirectory(relPath.slice(0, relPath.lastIndexOf('/')), session)) {
                     return;
                 }
-                if (session.disposed || this.remoteUpdates.hasPending(relPath)) {
+                if (session.disposed || this.remoteUpdates.hasPending(relPath) ||
+                    this.vfs.isRemoteEditorDirty?.(toUri)) {
                     return;
                 }
                 if (this.vfs.writeReviewedFile) {
                     const expected = options.onlyAdd ? undefined : this.baseCache[relPath];
                     await this.vfs.writeReviewedFile(toUri, content, expected,
                         () => !session.disposed && !this.remoteUpdates.hasPending(relPath) &&
+                            !this.vfs.isRemoteEditorDirty?.(toUri) &&
                             sameContent(this.baseCache[relPath], expected) &&
                             (!options.onlyAdd || !this.knownRemotePaths.has(relPath)));
                 } else {
@@ -968,23 +1051,31 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
             const syncOnFileChange = vscode.workspace
                 .getConfiguration('overleaf-workshop.localReplica.syncOnFileChange', this.baseUri)
                 .get('enabled', false);
+            await this.loadSyncManifest();
+            if (session.disposed) { return []; }
+            session.syncOnFileChange = syncOnFileChange;
             session.disposables.push(this.vfsWatcher.onDidChange(uri => this.syncFromVFS(uri, 'update')), this.vfsWatcher.onDidCreate(uri => this.syncFromVFS(uri, 'update')), this.vfsWatcher.onDidDelete(uri => this.syncFromVFS(uri, 'delete')), vscode.workspace.onDidSaveTextDocument(doc => this.onDocumentSaved(doc)), this.localWatcher.onDidCreate(uri => this.scheduleLocalSync(uri, 'create')), this.localWatcher.onDidDelete(uri => this.scheduleLocalSync(uri, 'delete')));
             if (syncOnFileChange) {
                 session.disposables.push(this.localWatcher.onDidChange(uri => this.scheduleLocalSync(uri, 'update')));
             }
-            await this.loadSyncManifest();
             const remoteChecked = await this.overwrite('/', session);
             if (session.disposed) {
                 return [];
             }
-            const recoverLocalAdds = async () => {
-                if (syncOnFileChange) { await this.reconcileLocalAdditions(session); }
+            const recoverLocalChanges = async () => {
+                if (!syncOnFileChange || session.localRecovery) { return; }
+                session.localRecovery = (async () => {
+                    await this.reconcileLocalEdits(session);
+                    await this.reconcileLocalAdditions(session);
+                })();
+                try { await session.localRecovery; }
+                finally { session.localRecovery = undefined; }
             };
             if (remoteChecked) {
-                void recoverLocalAdds().catch(() => {
+                void recoverLocalChanges().catch(() => {
                     if (!session.disposed) {
-                        this.status = { status: 'need-attention', message: 'Could not scan new local files; retrying automatically' };
-                        console.error('Local Replica scan of new local files failed; will retry');
+                        this.status = { status: 'need-attention', message: 'Could not check local changes; retrying automatically' };
+                        console.error('Local Replica check of local changes failed; will retry');
                     }
                 });
             }
@@ -992,7 +1083,7 @@ class LocalReplicaSCMProvider extends _1.BaseSCM {
             // events after sleep, reconnects, or a version gap.
             this.remotePollTimer = setInterval(() => {
                 if (this.manualSyncEvents) { return; }
-                void this.checkRemoteUpdates().then(recoverLocalAdds).catch(() => {
+                void this.checkRemoteUpdates().then(recoverLocalChanges).catch(() => {
                     if (!session.disposed) {
                         this.remoteCheckFailed = true;
                         this.status = { status: 'need-attention', message: 'Could not check Overleaf updates; retrying automatically' };

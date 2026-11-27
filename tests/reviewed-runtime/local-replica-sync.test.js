@@ -42,15 +42,21 @@ async function fixture(callback, { syncOnChange = true, beforeStart = () => {} }
             discoverLocalReplicas: async () => [],
         },
     });
-    const provider = new LocalReplicaSCMProvider(host.owner.vfs, host.owner.baseUri);
-    try {
+    let provider;
+    const restart = async () => {
+        provider?.dispose();
+        provider = new LocalReplicaSCMProvider(host.owner.vfs, host.owner.baseUri);
         await provider.initWatch();
+        return provider;
+    };
+    try {
+        await restart();
         const emit = (event, relative) => host.watchers
             .find(watcher => !watcher.disposed && watcher.pattern.base.scheme === "file")
             .emit(event, host.localUri(relative));
-        await callback(host, provider, emit);
+        await callback(host, provider, emit, restart);
     }
-    finally { provider.dispose(); }
+    finally { provider?.dispose(); }
 }
 
 async function eventually(predicate, message) {
@@ -259,22 +265,147 @@ test("manual push previews and uploads no-event files with auto change synchroni
         },
     }));
 
-test("recovery does not overwrite cloud files or infer local deletions while the watcher was stopped", () =>
-    fixture(async (host, provider) => {
+test("restart uploads an offline edit against its persisted base and leaves offline deletions for review", () =>
+    fixture(async (host, provider, _emit, restart) => {
         provider.dispose();
-        host.seedLocal("/Model.tex", "unsaved-to-cloud work from offline");
+        host.seedLocal("/Model.tex", "saved local edit during downtime");
         host.files.delete(host.localUri("/removed.tex").toString());
-        await provider.initWatch();
-        await drained(provider);
-        host.assertNoRemoteWrites();
-        assert.equal(host.remoteText("/Model.tex"), "initial");
+        const reopened = await restart();
+        await eventually(() => host.remoteText("/Model.tex") === "saved local edit during downtime",
+            "restart did not recover the edit to an existing file");
+        await drained(reopened);
+        assert.equal(reopened.remoteUpdates.hasPending("/Model.tex"), false);
+        assert.equal(reopened.remoteUpdates.hasPending("/removed.tex"), true);
         assert.equal(host.remoteText("/removed.tex"), "previous contents");
-        assert.equal(host.diskText("/Model.tex"), "unsaved-to-cloud work from offline");
+        assert.equal(remoteOperations(host, "/Model.tex", "write").length, 1);
+        assert.equal(remoteOperations(host, "/removed.tex", "delete").length, 0);
     }, {
         beforeStart(host) {
             host.seedLocal("/removed.tex", "previous contents");
             host.seedRemote("/removed.tex", "previous contents");
         },
+    }));
+
+test("a missed existing-file event is recovered at an unchanged cloud revision", () =>
+    fixture(async (host, provider) => {
+        await provider.checkRemoteUpdates();
+        host.seedLocal("/Model.tex", "saved by an external tool");
+        await provider.checkRemoteUpdates(true);
+        assert.equal(provider.remoteUpdates.hasPending("/Model.tex"), false);
+        provider.remotePollTimer.tick();
+        await eventually(() => host.remoteText("/Model.tex") === "saved by an external tool",
+            "the scan did not recover a missed event");
+        await drained(provider);
+        assert.equal(remoteOperations(host, "/Model.tex", "write").length, 1);
+    }));
+
+test("restart keeps both versions when the same tracked file changed on both sides", () =>
+    fixture(async (host, provider, _emit, restart) => {
+        provider.dispose();
+        host.seedRemote("/Model.tex", "independent cloud edit");
+        host.seedLocal("/Model.tex", "offline local edit");
+        const reopened = await restart();
+        assert.ok(reopened.remoteUpdates.hasPending("/Model.tex"));
+        await reopened.reconcileLocalEdits(reopened.watchSession);
+        host.assertNoRemoteWrites();
+        assert.equal(host.remoteText("/Model.tex"), "independent cloud edit");
+        assert.equal(host.diskText("/Model.tex"), "offline local edit");
+    }));
+
+test("legacy tracking without a verified base leaves divergent files for review", () =>
+    fixture(async (host, provider) => {
+        await provider.reconcileLocalEdits(provider.watchSession);
+        assert.ok(provider.remoteUpdates.hasPending("/Model.tex"));
+        host.assertNoRemoteWrites();
+        assert.equal(host.diskText("/Model.tex"), "legacy local change");
+    }, {
+        beforeStart(host) {
+            host.seedLocal("/.overleaf/remote-sync-state.json", '{"paths":["/Model.tex"]}');
+            host.seedLocal("/Model.tex", "legacy local change");
+        },
+    }));
+
+test("manual push previews a verified local-only edit as an update", () =>
+    fixture(async (host, provider) => {
+        host.seedLocal("/Model.tex", "local-only edit");
+        host.messageChoices.push(({ message, items }) => {
+            assert.match(message, /^Push to Overleaf/);
+            assert.match(items[0].detail, /Update \/Model\.tex/);
+            return undefined;
+        });
+        await provider.manualSync("push");
+        host.assertNoRemoteWrites();
+        assert.equal(host.diskText("/Model.tex"), "local-only edit");
+    }, { syncOnChange: false }));
+
+test("a failed manifest write preserves the previous baseline and can be retried", () =>
+    fixture(async (host, provider) => {
+        const manifestUri = host.localUri("/.overleaf/remote-sync-state.json");
+        const before = await host.vscode.workspace.fs.readFile(manifestUri);
+        const rename = host.vscode.workspace.fs.rename;
+        host.vscode.workspace.fs.rename = async () => { throw new Error("filesystem busy"); };
+        await assert.rejects(provider.recordSyncedState("/Model.tex", Buffer.from("verified update")), /filesystem busy/);
+        assert.deepEqual(await host.vscode.workspace.fs.readFile(manifestUri), before);
+        host.vscode.workspace.fs.rename = rename;
+        await provider.recordSyncedState("/Model.tex", Buffer.from("verified update"));
+        assert.notDeepEqual(await host.vscode.workspace.fs.readFile(manifestUri), before);
+    }));
+
+test("external edits stay local when file-change synchronization is disabled", () =>
+    fixture(async (host, provider) => {
+        await provider.checkRemoteUpdates();
+        host.seedLocal("/Model.tex", "edit with auto sync disabled");
+        await provider.checkRemoteUpdates(true);
+        assert.ok(provider.remoteUpdates.hasPending("/Model.tex"));
+        provider.remotePollTimer.tick();
+        await delay(120);
+        host.assertNoRemoteWrites();
+        assert.equal(host.remoteText("/Model.tex"), "initial");
+    }, { syncOnChange: false }));
+
+test("a failed update of an existing file is recovered on the next cloud check", () =>
+    fixture(async (host, provider, emit) => {
+        await provider.checkRemoteUpdates();
+        let failures = 0;
+        const writeFile = host.vscode.workspace.fs.writeFile;
+        host.vscode.workspace.fs.writeFile = async (uri, bytes) => {
+            if (uri.toString() === host.remoteUri("/Model.tex").toString() && !failures++) {
+                throw new Error("connection interrupted");
+            }
+            return writeFile(uri, bytes);
+        };
+        host.seedLocal("/Model.tex", "retained local edit");
+        await emit("change", "/Model.tex");
+        await eventually(() => failures > 0, "the initial update was not attempted");
+        await drained(provider);
+        assert.equal(host.remoteText("/Model.tex"), "initial");
+        provider.remotePollTimer.tick();
+        await eventually(() => host.remoteText("/Model.tex") === "retained local edit",
+            "the failed update was not retried");
+        await drained(provider);
+        assert.equal(provider.remoteUpdates.hasPending("/Model.tex"), false);
+    }));
+
+test("a recovered update passes the verified base to the guarded write", () =>
+    fixture(async (host, provider) => {
+        let attempted = false;
+        host.owner.vfs.writeReviewedFile = async (uri, bytes, base, isCurrent) => {
+            assert.equal(uri.toString(), host.remoteUri("/Model.tex").toString());
+            assert.equal(base.toString(), "initial");
+            assert.equal(bytes.toString(), "local edit");
+            assert.equal(isCurrent(), true);
+            attempted = true;
+            host.seedRemote("/Model.tex", "concurrent remote edit");
+            throw Object.assign(new Error("remote changed before write"), { code: "RemoteChanged" });
+        };
+        host.seedLocal("/Model.tex", "local edit");
+        await provider.reconcileLocalEdits(provider.watchSession);
+        assert.equal(attempted, true);
+        await provider.checkRemoteUpdates(true);
+        assert.ok(provider.remoteUpdates.hasPending("/Model.tex"));
+        host.assertNoRemoteWrites();
+        assert.equal(host.diskText("/Model.tex"), "local edit");
+        assert.equal(host.remoteText("/Model.tex"), "concurrent remote edit");
     }));
 
 test("a real populated directory rename needs only the new parent create event", async () => {

@@ -15,7 +15,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 BASE_SHA256 = "2a27cbaea6af4800bf75c97f4a71ebc6d39f27bf794dd5be5c029bc22e942cc7"
 BASE_VERSION = "0.15.10"
-VERSION = "0.15.11"
+VERSION = "0.15.12"
 REPOSITORY = "https://github.com/De1gel/Overleaf-Workshop"
 OVERLAY = "hotfixes/reviewed-runtime/"
 
