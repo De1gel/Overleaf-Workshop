@@ -12,6 +12,7 @@ class SocketIOAPI {
         this.identity = identity;
         this.projectId = projectId;
         this.disposed = false;
+        this.pendingDocumentWrites = 0;
         this.scheme = 'v1';
         this._handlers = [];
         this.init();
@@ -356,10 +357,13 @@ class SocketIOAPI {
      * @returns {Promise}
      */
     async applyOtUpdate(docId, update) {
-        return this.emit('applyOtUpdate', docId, update)
-            .then(() => {
-            return;
-        });
+        this.pendingDocumentWrites++;
+        try {
+            await this.emit('applyOtUpdate', docId, update);
+        }
+        finally {
+            this.pendingDocumentWrites--;
+        }
     }
     /**
      * Reference: services/web/frontend/js/ide/online-users/OnlineUserManager.js#L42

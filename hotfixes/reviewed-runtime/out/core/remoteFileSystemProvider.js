@@ -197,7 +197,6 @@ class VirtualFileSystem extends vscode.Disposable {
         if (this.localReplicaStopped || this.remoteSyncDisposed) {
             throw new Error('Remote project is no longer active');
         }
-        this.remoteSnapshotRequested = true;
         if (!this.remoteSnapshotPromise) {
             this.remoteSnapshotActive = true;
             this.remoteSnapshotPromise = (async () => {
@@ -213,6 +212,57 @@ class VirtualFileSystem extends vscode.Disposable {
         }
         return this.remoteSnapshotPromise;
     }
+    async remoteEntityPaths() {
+        const identity = await globalStateManager_1.GlobalStateManager.authenticate(this.context, this.serverName);
+        const result = await this.api.projectEntitiesJson(identity, this.projectId);
+        if (result.type !== 'success' || !Array.isArray(result.entities)) {
+            throw new Error('Unable to verify the remote project tree');
+        }
+        const paths = new Map();
+        for (const entity of result.entities) {
+            if (!entity || typeof entity.path !== 'string' || !['doc', 'file', 'folder'].includes(entity.type)) {
+                throw new Error('Invalid entry in the remote project tree');
+            }
+            const path = entity.path.replace(/\/$/, '');
+            if (!path && entity.type === 'folder') {
+                continue;
+            }
+            if (!path.startsWith('/') || /[\\\x00-\x1f]/.test(path) ||
+                path.slice(1).split('/').some(part => !part || part === '.' || part === '..') ||
+                paths.has(path)) {
+                throw new Error('Invalid path in the remote project tree');
+            }
+            paths.set(path, entity.type);
+        }
+        return paths;
+    }
+    remoteTreeMatches(entries, remotePaths) {
+        // Some server versions only list files. Still compare explicit folders
+        // whenever the API includes them.
+        const includesFolders = [...remotePaths.values()].includes('folder');
+        return [...remotePaths].every(([path, type]) => entries.get(path)?.type === type) &&
+            [...entries].every(([path, { type }]) =>
+                (!includesFolders && type === 'folder') || remotePaths.get(path) === type);
+    }
+    async refreshDocumentsOnCurrentConnection(entries) {
+        const events = [];
+        for (const [path, entry] of entries) {
+            if (this.remoteSnapshotRequested) {
+                break; // A structural event invalidated the list being scanned.
+            }
+            if (entry.type === 'doc') {
+                const uri = this.pathToUri(path);
+                await this.readRemoteFile(uri, true);
+                if (entry.entity.remoteCache !== entry.remoteCache) {
+                    events.push({ type: vscode.FileChangeType.Changed, uri });
+                }
+            }
+        }
+        if (events.length && !this.remoteSyncDisposed && !this.localReplicaStopped) {
+            this.isDirty = true;
+            this.notify(events);
+        }
+    }
     async refreshRemoteSnapshotOnce() {
         await this.init();
         const previousRoot = this.root;
@@ -224,22 +274,42 @@ class VirtualFileSystem extends vscode.Disposable {
             // A missed structural event may have damaged only the cached tree.
             // Recover from the authoritative snapshot without inferring deletions
             // from an untrusted old cache.
-            previousEntries = new Map();
         }
-        const previousById = new Map([...previousEntries.values()].map(entry => [entry.entity._id, entry]));
         if (this.socket.isUsingAlternativeConnectionScheme) {
             // Alt.joinProject returns its old record, not an authoritative new tree.
             throw new Error('A fresh project snapshot is unavailable in Invisible Mode');
         }
         if (this.socket.scheme === 'v2') {
+            const remotePaths = await this.remoteEntityPaths();
+            if (this.remoteSyncDisposed || this.localReplicaStopped || this.remoteSnapshotRequested) {
+                return;
+            }
+            if (previousEntries && this.remoteTreeMatches(previousEntries, remotePaths)) {
+                try {
+                    await this.refreshDocumentsOnCurrentConnection(previousEntries);
+                    return;
+                }
+                catch (error) {
+                    if (this.remoteSnapshotRequested) {
+                        return;
+                    }
+                    // A path can be deleted and recreated under the same name.
+                    // An explicit missing document ID warrants a new tree.
+                    if (!['FileNotFound', 'NotFound', 'EntityNotFound', 'DocNotFound'].includes(error?.code)) {
+                        throw error;
+                    }
+                }
+            }
             const activeLocalSync = this.scmCollectionItem?.collection.scms?.some(item => item.scm?.activeSyncs > 0);
-            if (this.socket.unSyncFileChanges > 0 || activeLocalSync) {
+            if (this.socket.pendingDocumentWrites > 0 || activeLocalSync) {
                 throw new Error('Remote changes are waiting to be uploaded; retry the snapshot later');
             }
             // v2.joinProject otherwise returns the first connection's cached record.
             // Recreate only the transport; retain this VFS, SCM, and pending reviews.
             this.socket.init();
         }
+        previousEntries ??= new Map();
+        const previousById = new Map([...previousEntries.values()].map(entry => [entry.entity._id, entry]));
         const joined = await this.socket.joinProject(this.projectId);
         this.snapshotEntries(joined);
         const previousRootId = previousRoot?.rootFolder?.[0]?._id;
@@ -279,11 +349,18 @@ class VirtualFileSystem extends vscode.Disposable {
         if (this.localReplicaStopped || this.remoteSyncDisposed) {
             throw new Error('Remote project is no longer active');
         }
-        // An editor may become dirty while other documents are being fetched.
+        // A live update or an editor change can arrive during the scan.
         for (const entry of nextEntries.values()) {
             const old = previousById.get(entry.entity._id);
-            if (entry.type === 'doc' && old &&
-                (this.isRemoteEditorDirty(this.pathToUri(entry.path)) || this.isRemoteEditorDirty(this.pathToUri(old.path)))) {
+            if (entry.type !== 'doc' || !old) {
+                continue;
+            }
+            if (old.entity.version > entry.entity.version && old.entity.remoteCache !== undefined) {
+                entry.entity.version = old.entity.version;
+                entry.entity.remoteCache = old.entity.remoteCache;
+                entry.entity.localCache = old.entity.localCache;
+            }
+            if (this.isRemoteEditorDirty(this.pathToUri(entry.path)) || this.isRemoteEditorDirty(this.pathToUri(old.path))) {
                 entry.entity.localCache = old.entity.localCache;
             }
         }
@@ -505,14 +582,14 @@ class VirtualFileSystem extends vscode.Disposable {
         })();
         return { parentFolder, fileName, fileEntity, fileType, fileId };
     }
-    _resolveById(entityId, root, path) {
+    _resolveById(entityId, root, path, parentFolder) {
         if (!this.root) {
             throw vscode.FileSystemError.FileNotFound();
         }
         root = root || this.root.rootFolder[0];
         path = path || '/';
         if (root._id === entityId) {
-            return { parentFolder: root, fileType: 'folder', fileEntity: root, path };
+            return { parentFolder: parentFolder ?? root, fileType: 'folder', fileEntity: root, path };
         }
         else {
             // search files in root
@@ -528,7 +605,7 @@ class VirtualFileSystem extends vscode.Disposable {
             }
             // recursive search
             for (const folder of root.folders) {
-                const res = this._resolveById(entityId, folder, path + folder.name + '/');
+                const res = this._resolveById(entityId, folder, path + folder.name + '/', root);
                 if (res) {
                     return res;
                 }
@@ -644,7 +721,7 @@ class VirtualFileSystem extends vscode.Disposable {
                 if (this.remoteSnapshotActive) {
                     this.remoteSnapshotRequested = true;
                 }
-                const res = this._resolveById(parentFolderId);
+                const res = this.root && this._resolveById(parentFolderId);
                 if (res) {
                     const { fileEntity, path } = res;
                     const entityPath = path + entity.name;
@@ -658,14 +735,14 @@ class VirtualFileSystem extends vscode.Disposable {
                 if (this.remoteSnapshotActive) {
                     this.remoteSnapshotRequested = true;
                 }
-                const res = this._resolveById(entityId);
+                const res = this.root && this._resolveById(entityId);
                 if (res) {
                     const { fileEntity } = res;
-                    const oldName = fileEntity.name;
+                    const previousPath = res.path.replace(/\/$/, '');
                     fileEntity.name = newName;
                     this.notify([
-                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path) },
-                        { type: vscode.FileChangeType.Created, uri: this.pathToUri(res.path.replace(oldName, newName)) }
+                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(previousPath) },
+                        { type: vscode.FileChangeType.Created, uri: this.pathToUri(previousPath.slice(0, previousPath.lastIndexOf('/') + 1), newName) }
                     ]);
                 }
             },
@@ -673,12 +750,12 @@ class VirtualFileSystem extends vscode.Disposable {
                 if (this.remoteSnapshotActive) {
                     this.remoteSnapshotRequested = true;
                 }
-                const res = this._resolveById(entityId);
+                const res = this.root && this._resolveById(entityId);
                 if (res) {
                     const { parentFolder, fileType, fileEntity } = res;
                     this.removeEntity(parentFolder, fileType, fileEntity);
                     this.notify([
-                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path) }
+                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path.replace(/\/$/, '')) }
                     ]);
                 }
             },
@@ -686,14 +763,14 @@ class VirtualFileSystem extends vscode.Disposable {
                 if (this.remoteSnapshotActive) {
                     this.remoteSnapshotRequested = true;
                 }
-                const oldPath = this._resolveById(entityId);
-                const newPath = this._resolveById(folderId);
-                if (oldPath && newPath) {
+                const oldPath = this.root && this._resolveById(entityId);
+                const newPath = this.root && this._resolveById(folderId);
+                if (oldPath && newPath?.fileType === 'folder' && oldPath.parentFolder !== newPath.fileEntity) {
                     const newParentFolder = newPath.fileEntity;
                     this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([
-                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path) },
+                        { type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path.replace(/\/$/, '')) },
                         { type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name) }
                     ]);
                 }
@@ -701,9 +778,6 @@ class VirtualFileSystem extends vscode.Disposable {
             onFileChanged: (update) => {
                 if (this.localReplicaStopped || this.remoteSyncDisposed) {
                     return;
-                }
-                if (this.remoteSnapshotActive) {
-                    this.remoteSnapshotRequested = true;
                 }
                 const res = this.root && this._resolveById(update.doc);
                 if (!res || res.fileType !== 'doc') {

@@ -13,9 +13,12 @@ from tempfile import NamedTemporaryFile
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 
-BASE_SHA256 = "2a27cbaea6af4800bf75c97f4a71ebc6d39f27bf794dd5be5c029bc22e942cc7"
-BASE_VERSION = "0.15.10"
-VERSION = "0.15.12"
+BASE_VERSIONS = {
+    "2a27cbaea6af4800bf75c97f4a71ebc6d39f27bf794dd5be5c029bc22e942cc7": "0.15.10",
+    "ff114daa0fed5bd0e8f633b70e37df448d6f72a7296fdc0362d4f4ebe8e83964": "0.15.12",
+}
+OVERLAY_VERSION = "0.15.10"
+VERSION = "0.15.13"
 REPOSITORY = "https://github.com/De1gel/Overleaf-Workshop"
 OVERLAY = "hotfixes/reviewed-runtime/"
 
@@ -43,22 +46,23 @@ def committed_overlay(repo, revision):
 def base_entries(base):
     archive = base.read_bytes()
     digest = sha256(archive).hexdigest()
-    if digest != BASE_SHA256:
-        raise ValueError(f"Base VSIX SHA-256 must be {BASE_SHA256}. Found {digest}.")
+    if digest not in BASE_VERSIONS:
+        raise ValueError(f"Unrecognized base VSIX SHA-256: {digest}.")
     with ZipFile(BytesIO(archive)) as vsix:
-        return {
+        entries = {
             entry.filename: (vsix.read(entry), (entry.external_attr >> 16) & 0o777)
             for entry in vsix.infolist()
             if not entry.is_dir()
         }
+    return digest, entries
 
 
-def stamp(entries, commit):
+def stamp(entries, commit, base_digest):
     package_path = "extension/package.json"
     package_bytes, package_mode = entries[package_path]
     package = json.loads(package_bytes)
     if (package.get("publisher"), package.get("name"), package.get("version")) != (
-        "iamhyc", "overleaf-workshop", BASE_VERSION
+        "iamhyc", "overleaf-workshop", OVERLAY_VERSION
     ):
         raise ValueError("Unexpected extension identity or overlay version")
     package.pop("__metadata", None)
@@ -66,13 +70,13 @@ def stamp(entries, commit):
     package["overleafWorkshopBuild"] = {
         "repository": REPOSITORY,
         "commit": commit,
-        "baseVSIXSHA256": BASE_SHA256,
+        "baseVSIXSHA256": base_digest,
     }
     entries[package_path] = (f"{json.dumps(package, indent=2, ensure_ascii=False)}\n".encode(), package_mode)
 
     manifest_path = "extension.vsixmanifest"
     manifest, manifest_mode = entries[manifest_path]
-    pattern = rb'(<Identity\b[^>]*\bVersion=")' + re.escape(BASE_VERSION.encode()) + rb'(")'
+    pattern = rb'(<Identity\b[^>]*\bVersion=")' + re.escape(BASE_VERSIONS[base_digest].encode()) + rb'(")'
     manifest, matches = re.subn(pattern, lambda match: match[1] + VERSION.encode() + match[2], manifest)
     if matches != 1:
         raise ValueError("Could not uniquely update the VSIX extension identity")
@@ -96,7 +100,7 @@ def write_vsix(output, entries):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", type=Path, required=True, help="original overleaf-workshop-local.vsix")
+    parser.add_argument("--base", type=Path, required=True, help="verified original or reviewed Overleaf Workshop VSIX")
     parser.add_argument("--output", type=Path, required=True, help="output VSIX path")
     parser.add_argument("--revision", default="HEAD", help="Git commit or ref that contains the runtime overlay")
     args = parser.parse_args()
@@ -106,9 +110,9 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     try:
         commit, overlay = committed_overlay(repo, args.revision)
-        entries = base_entries(args.base)
+        base_digest, entries = base_entries(args.base)
         entries.update(overlay)
-        stamp(entries, commit)
+        stamp(entries, commit, base_digest)
         write_vsix(args.output, entries)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Packaging failed: {error}\n")

@@ -16,7 +16,10 @@ class Uri {
     constructor(scheme, authority, pathname, query = "", fragment = "") {
         Object.assign(this, { scheme, authority, path: pathname, query, fragment });
     }
-    static file(value) { return new Uri("file", "", path.resolve(value)); }
+    static file(value) {
+        const pathname = path.resolve(value).split(path.sep).join("/");
+        return new Uri("file", "", pathname.startsWith("/") ? pathname : "/" + pathname);
+    }
     static from(value) { return new Uri(value.scheme, value.authority ?? "", value.path ?? "", value.query ?? "", value.fragment ?? ""); }
     static parse(value) {
         const parsed = new URL(value);
@@ -183,6 +186,7 @@ function createHarness() {
     }
     const vscode = {
         Uri, Disposable, Position, Range, WorkspaceEdit,
+        FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
         ThemeIcon: class ThemeIcon { constructor(id) { this.id = id; } },
         RelativePattern: class RelativePattern { constructor(base, pattern) { Object.assign(this, { base, pattern }); } },
         EventEmitter: class EventEmitter {
