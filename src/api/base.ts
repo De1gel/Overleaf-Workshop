@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import * as FormData from 'form-data';
+import FormData = require('form-data');
 import { v4 as uuidv4 } from 'uuid';
 import { fetch } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';

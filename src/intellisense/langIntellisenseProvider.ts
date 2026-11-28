@@ -28,12 +28,15 @@ export class LangIntellisenseProvider {
             new MisspellingCheckProvider(vfsm),
         ];
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -2);
-        // Enable CSpell
         const config = vscode.workspace.getConfiguration("cSpell");
-        const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes") || {}; 
-        enabledSchemes[ROOT_NAME] = true; 
-        config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global);
-        
+        const setting = config.inspect<Record<string, boolean>>("enabledSchemes");
+        const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes");
+        if (setting && enabledSchemes?.[ROOT_NAME] === undefined) {
+            const globalSchemes = { ...setting.globalValue, [ROOT_NAME]: true };
+            void config.update("enabledSchemes", globalSchemes, vscode.ConfigurationTarget.Global)
+                .then(undefined, () => console.warn("Could not enable CSpell for Overleaf documents"));
+        }
+
         this.activate();
     }
 
