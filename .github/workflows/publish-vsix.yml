@@ -1,0 +1,68 @@
+name: Publish Overleaf Workshop 0.15.13
+
+on:
+  push:
+    branches:
+      - release/v0.15.13-assets
+
+permissions:
+  contents: read
+
+jobs:
+  verify-installation:
+    name: Install VSIX on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install into a clean VS Code profile
+        shell: bash
+        run: |
+          shasum -a 256 -c SHA256SUMS.txt
+          vscode="$RUNNER_TEMP/vscode-desktop"
+          mkdir -p "$vscode"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            curl --fail --location --retry 3 --output "$vscode/code.tar.gz" \
+              https://update.code.visualstudio.com/latest/linux-x64/stable
+            tar -xzf "$vscode/code.tar.gz" -C "$vscode" --strip-components=1
+            code="$vscode/bin/code"
+          else
+            platform=darwin
+            if [[ "$(uname -m)" == "arm64" ]]; then
+              platform=darwin-arm64
+            fi
+            curl --fail --location --retry 3 --output "$vscode/code.zip" \
+              "https://update.code.visualstudio.com/latest/$platform/stable"
+            ditto -x -k "$vscode/code.zip" "$vscode"
+            code="$vscode/Visual Studio Code.app/Contents/Resources/app/bin/code"
+          fi
+          config=(--user-data-dir "$RUNNER_TEMP/overleaf-profile" --extensions-dir "$RUNNER_TEMP/overleaf-extensions")
+          "$code" --version
+          "$code" "${config[@]}" --install-extension "$GITHUB_WORKSPACE/overleaf-workshop-0.15.13.vsix"
+          "$code" "${config[@]}" --list-extensions --show-versions | grep -Fx 'iamhyc.overleaf-workshop@0.15.13'
+
+  publish:
+    needs: verify-installation
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify and publish the tested VSIX
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum --check --strict SHA256SUMS.txt
+          gh release create v0.15.13 overleaf-workshop-0.15.13.vsix SHA256SUMS.txt \
+            --target 5e6d7aff78460da2a8868a1c25d8b688efc41fdf --title '0.15.13' \
+            --notes-file release-notes.md --latest
